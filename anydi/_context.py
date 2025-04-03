@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-import abc
 import contextlib
+import threading
 import inspect
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Callable, ClassVar
+from typing import TYPE_CHECKING, Callable, ClassVar
 
-from typing_extensions import Self, final
+import abc
 
 from ._provider import CallableKind, Provider
-from ._types import AnyInterface, Scope, is_event_type
-from ._utils import get_full_qualname, run_async
+from ._types import AnyInterface, Scope
+from ._utils import get_full_qualname
 
 if TYPE_CHECKING:
     from ._container import Container
@@ -83,26 +83,6 @@ class ScopedContext(abc.ABC):
                 "or set in the scoped context."
             )
 
-    def _get_provider_params(
-        self, provider: Provider
-    ) -> tuple[list[Any], dict[str, Any]]:
-        """Retrieve the arguments for a provider."""
-        args: list[Any] = []
-        kwargs: dict[str, Any] = {}
-
-        for parameter in provider.parameters:
-            if parameter.annotation in self.container._override_instances:  # noqa
-                instance = self.container._override_instances[parameter.annotation]  # noqa
-            elif parameter.annotation in self._instances:
-                instance = self._instances[parameter.annotation]
-            else:
-                instance = self._resolve_parameter(provider, parameter)
-            if parameter.kind == parameter.POSITIONAL_ONLY:
-                args.append(instance)
-            else:
-                kwargs[parameter.name] = instance
-        return args, kwargs
-
     async def _aget_provider_params(
         self, provider: Provider
     ) -> tuple[list[Any], dict[str, Any]]:
@@ -123,87 +103,55 @@ class ScopedContext(abc.ABC):
                 kwargs[parameter.name] = instance
         return args, kwargs
 
+from typing import Any
 
-class ResourceScopedContext(ScopedContext):
-    """ScopedContext with closable resources support."""
+from typing_extensions import Self
 
-    def __init__(self, container: Container) -> None:
-        """Initialize the ScopedContext."""
-        super().__init__(container)
+from ._utils import AsyncRLock, run_async
+
+
+class InstanceContext:
+    """A context to store instances."""
+
+    __slots__ = ("_instances", "_stack", "_async_stack", "_lock", "_async_lock")
+
+    def __init__(self) -> None:
+        self._instances: dict[type[Any], Any] = {}
         self._stack = contextlib.ExitStack()
         self._async_stack = contextlib.AsyncExitStack()
+        self._lock = threading.RLock()
+        self._async_lock = AsyncRLock()
 
-    def get_or_create(self, provider: Provider) -> tuple[Any, bool]:
-        """Get an instance of a dependency from the scoped context."""
-        instance = self._instances.get(provider.interface)
-        if instance is None:
-            if provider.kind == CallableKind.GENERATOR:
-                instance = self._create_resource(provider)
-            elif provider.kind == CallableKind.ASYNC_GENERATOR:
-                raise TypeError(
-                    f"The provider `{provider}` cannot be started in synchronous mode "
-                    "because it is an asynchronous provider. Please start the provider "
-                    "in asynchronous mode before using it."
-                )
-            else:
-                instance = self._create_instance(provider)
-            self._instances[provider.interface] = instance
-            return instance, True
-        return instance, False
+    def get(self, interface: type[Any]) -> Any | None:
+        """Get an instance from the context."""
+        return self._instances.get(interface)
 
-    async def aget_or_create(self, provider: Provider) -> tuple[Any, bool]:
-        """Get an async instance of a dependency from the scoped context."""
-        instance = self._instances.get(provider.interface)
-        if instance is None:
-            if provider.kind == CallableKind.GENERATOR:
-                instance = await run_async(self._create_resource, provider)
-            elif provider.kind == CallableKind.ASYNC_GENERATOR:
-                instance = await self._acreate_resource(provider)
-            else:
-                instance = await self._acreate_instance(provider)
-            self._instances[provider.interface] = instance
-            return instance, True
-        return instance, False
+    def set(self, interface: type[Any], value: Any) -> None:
+        """Set an instance in the context."""
+        self._instances[interface] = value
 
-    def has(self, interface: AnyInterface) -> bool:
-        """Check if the scoped context has an instance of the dependency."""
-        return interface in self._instances
-
-    def _create_instance(self, provider: Provider) -> Any:
-        """Create an instance using the provider."""
-        instance = super()._create_instance(provider)
-        # Enter the context manager if the instance is closable.
-        if hasattr(instance, "__enter__") and hasattr(instance, "__exit__"):
-            self._stack.enter_context(instance)
-        return instance
-
-    def _create_resource(self, provider: Provider) -> Any:
-        """Create a resource using the provider."""
-        args, kwargs = self._get_provider_params(provider)
-        cm = contextlib.contextmanager(provider.call)(*args, **kwargs)
+    def enter(self, cm: contextlib.AbstractContextManager[Any]) -> Any:
+        """Enter the context."""
         return self._stack.enter_context(cm)
 
-    async def _acreate_instance(self, provider: Provider) -> Any:
-        """Create an instance asynchronously using the provider."""
-        instance = await super()._acreate_instance(provider)
-        # Enter the context manager if the instance is closable.
-        if hasattr(instance, "__aenter__") and hasattr(instance, "__aexit__"):
-            await self._async_stack.enter_async_context(instance)
-        return instance
-
-    async def _acreate_resource(self, provider: Provider) -> Any:
-        """Create a resource asynchronously using the provider."""
-        args, kwargs = await self._aget_provider_params(provider)
-        cm = contextlib.asynccontextmanager(provider.call)(*args, **kwargs)
+    async def aenter(self, cm: contextlib.AbstractAsyncContextManager[Any]) -> Any:
+        """Enter the context asynchronously."""
         return await self._async_stack.enter_async_context(cm)
 
-    def delete(self, interface: AnyInterface) -> None:
-        """Delete a dependency instance from the scoped context."""
+    def __setitem__(self, interface: type[Any], value: Any) -> None:
+        self._instances[interface] = value
+
+    def __getitem__(self, interface: type[Any]) -> Any:
+        return self._instances[interface]
+
+    def __contains__(self, interface: type[Any]) -> bool:
+        return interface in self._instances
+
+    def __delitem__(self, interface: type[Any]) -> None:
         self._instances.pop(interface, None)
 
     def __enter__(self) -> Self:
         """Enter the context."""
-        self.start()
         return self
 
     def __exit__(
@@ -211,15 +159,9 @@ class ResourceScopedContext(ScopedContext):
         exc_type: type[BaseException] | None,
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
-    ) -> bool:
+    ) -> Any:
         """Exit the context."""
-        return self._stack.__exit__(exc_type, exc_val, exc_tb)  # type: ignore[return-value]
-
-    @abc.abstractmethod
-    def start(self) -> None:
-        """Start the scoped context."""
-        for interface in self.container._resource_cache.get(self.scope, []):  # noqa
-            self.container.resolve(interface)
+        return self._stack.__exit__(exc_type, exc_val, exc_tb)
 
     def close(self) -> None:
         """Close the scoped context."""
@@ -227,7 +169,6 @@ class ResourceScopedContext(ScopedContext):
 
     async def __aenter__(self) -> Self:
         """Enter the context asynchronously."""
-        await self.astart()
         return self
 
     async def __aexit__(
@@ -241,65 +182,14 @@ class ResourceScopedContext(ScopedContext):
             self.__exit__, exc_type, exc_val, exc_tb
         ) or await self._async_stack.__aexit__(exc_type, exc_val, exc_tb)
 
-    @abc.abstractmethod
-    async def astart(self) -> None:
-        """Start the scoped context asynchronously."""
-
     async def aclose(self) -> None:
         """Close the scoped context asynchronously."""
         await self.__aexit__(None, None, None)
 
+    def lock(self) -> threading.RLock:
+        """Acquire the context lock."""
+        return self._lock
 
-@final
-class SingletonContext(ResourceScopedContext):
-    """A scoped context representing the "singleton" scope."""
-
-    scope = "singleton"
-
-    def start(self) -> None:
-        """Start the scoped context."""
-        for interface in self.container._resource_cache.get(self.scope, []):  # noqa
-            self.container.resolve(interface)
-
-    async def astart(self) -> None:
-        """Start the scoped context asynchronously."""
-        for interface in self.container._resource_cache.get(self.scope, []):  # noqa
-            await self.container.aresolve(interface)
-
-
-@final
-class RequestContext(ResourceScopedContext):
-    """A scoped context representing the "request" scope."""
-
-    scope = "request"
-
-    def start(self) -> None:
-        """Start the scoped context."""
-        for interface in self.container._resource_cache.get(self.scope, []):  # noqa
-            if not is_event_type(interface):
-                continue
-            self.container.resolve(interface)
-
-    async def astart(self) -> None:
-        """Start the scoped context asynchronously."""
-        for interface in self.container._resource_cache.get(self.scope, []):  # noqa
-            if not is_event_type(interface):
-                continue
-            await self.container.aresolve(interface)
-
-
-@final
-class TransientContext(ScopedContext):
-    """A scoped context representing the "transient" scope."""
-
-    scope = "transient"
-
-    def get_or_create(self, provider: Provider) -> tuple[Any, bool]:
-        """Get or create an instance of a dependency from the transient context."""
-        return self._create_instance(provider), True
-
-    async def aget_or_create(self, provider: Provider) -> tuple[Any, bool]:
-        """
-        Get or create an async instance of a dependency from the transient context.
-        """
-        return await self._acreate_instance(provider), True
+    def alock(self) -> AsyncRLock:
+        """Acquire the context lock asynchronously."""
+        return self._async_lock
