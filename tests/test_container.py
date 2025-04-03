@@ -1301,18 +1301,18 @@ class TestContainer:
         assert not resource.committed
         assert resource.rolled_back
 
-    def test_alias_string(container: Container) -> None:
-    container.register(
-        Annotated[str, "message"],
-        lambda: "test",
-        scope="singleton",
-    )
+    def test_alias_string(self, container: Container) -> None:
+        container.register(
+            Annotated[str, "message"],
+            lambda: "test",
+            scope="singleton",
+        )
 
-    container.alias(Annotated[str, "message"], Annotated[str, "alias"])
+        container.alias(Annotated[str, "message"], Annotated[str, "alias"])
 
-    assert container.resolve(Annotated[str, "message"]) == container.resolve(
-        Annotated[str, "alias"]
-    )
+        assert container.resolve(Annotated[str, "message"]) == container.resolve(
+            Annotated[str, "alias"]
+        )
 
 
 def test_alias_already_registered(container: Container) -> None:
